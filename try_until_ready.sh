@@ -26,20 +26,31 @@ else
   fi
 fi
 
+# ----- Optional Finnish proxy (set YLE_PROXY_URL) -----
+# Example: http://user:pass@fi-proxy.example.com:3128  OR  https://fi-proxy.example.com:443
+PROXY="${YLE_PROXY_URL:-}"
+if [[ -n "$PROXY" ]]; then
+  export http_proxy="$PROXY"
+  export https_proxy="$PROXY"
+  # Pass through to yle-dl as well:
+  YLEDL="$YLEDL --proxy $PROXY"
+  echo "Using proxy for Yle: $PROXY"
+fi
+
 command -v ffmpeg >/dev/null 2>&1 || { echo "❌ ffmpeg not found (apt.txt should install it)"; exit 1; }
 echo "Using yle-dl via: $YLEDL"
 echo "Using ffmpeg: $(ffmpeg -version 2>/dev/null | head -n1)"
 
-# -------- Resolvers --------
-
-# RSS → plain → __NEXT_DATA__ JSON → HTML scan → yle-dl --verbose scrape
+# -------- Resolver (series:ID -> latest episode) with robust fallbacks --------
 resolve_latest() {
   local sid="$1"
   "$PY" - <<PY
-import re, json, requests, xml.etree.ElementTree as ET, subprocess, shlex, os, sys
+import re, json, os, requests, xml.etree.ElementTree as ET, subprocess
+
 sid = "$sid".strip()
 session = requests.Session()
 session.headers.update({"User-Agent":"Mozilla/5.0 (yle-clip-bot)"})
+# Respect proxy env (http_proxy/https_proxy) automatically.
 
 def try_rss(url):
     try:
@@ -54,15 +65,15 @@ def try_rss(url):
         pass
     return ""
 
-# 1) downloadable-only feed
+# 1) downloadable-only
 link = try_rss(f"https://feeds.yle.fi/areena/v1/series/{sid}.rss?downloadable=true")
-# 2) plain feed
+# 2) plain
 if not link:
     link = try_rss(f"https://feeds.yle.fi/areena/v1/series/{sid}.rss")
 
 def collect_ids_from_nextdata(html: str):
     m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, flags=re.S)
-    if not m:
+    if not m: 
         return []
     try:
         data = json.loads(m.group(1))
@@ -96,7 +107,7 @@ if not link:
     except Exception:
         pass
 
-# 4) raw HTML scan for "1-########"
+# 4) raw HTML scan
 if not link:
     try:
         r = session.get(f"https://areena.yle.fi/{sid}", timeout=20)
@@ -114,23 +125,14 @@ if not link:
     except Exception:
         pass
 
-# 5) FINAL fallback: ask yle-dl --verbose on the series page and parse program_id / id
+# 5) ask yle-dl --verbose on the series page and parse id/program_id
 if not link:
     try:
-        # Build the yle-dl command shown by the shell script
-        # We don't want to download yet; just get verbose output and parse it.
-        env = os.environ.copy()
-        cmd = os.environ.get("YLEDL_CMD","").strip()
-        if not cmd:
-            # Best effort: use "yle-dl" and let PATH/module decide
-            cmd = "yle-dl"
-        full = f"{cmd} --verbose -o /dev/null https://areena.yle.fi/{sid}"
+        yledl_cmd = os.environ.get("YLEDL_CMD","yle-dl")
+        full = f"{yledl_cmd} --verbose -o /dev/null https://areena.yle.fi/{sid}"
         proc = subprocess.run(full, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
         out = proc.stdout
-        # Look for JSON-like hints: "program_id": "1-########" OR plain "id": "1-########"
-        m = re.search(r'"program_id"\\s*:\\s*"(?P<id>1-\\d+)"', out)
-        if not m:
-            m = re.search(r'"id"\\s*:\\s*"(?P<id>1-\\d+)"', out)
+        m = re.search(r'"program_id"\\s*:\\s*"(?P<id>1-\\d+)"', out) or re.search(r'"id"\\s*:\\s*"(?P<id>1-\\d+)"', out)
         if m:
             link = "https://areena.yle.fi/" + m.group("id")
     except Exception:
@@ -140,12 +142,11 @@ print(link or "", end="")
 PY
 }
 
-# -------- Use resolver if series:ID --------
+# Use resolver if series:ID
 if [[ "$URL" == series:* ]]; then
   SID="${URL#series:}"
   SID="$(printf '%s' "$SID" | xargs)"
   echo "Resolving latest episode for series ID: $SID"
-  # Expose the chosen YLEDL launcher to the Python fallback (step 5)
   export YLEDL_CMD="$YLEDL"
   LATEST="$(resolve_latest "$SID" || true)"
   if [[ -z "${LATEST:-}" ]]; then
@@ -160,7 +161,7 @@ fi
 echo "Target episode URL: [$URL]"
 echo "Output name:        [$OUT]"
 
-# -------- Main loop --------
+# Main loop
 while true; do
   if "$PY" yle_clip_bot.py "$URL" --out "$OUT"; then
     echo "✅ Done: $OUT"; exit 0
