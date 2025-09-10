@@ -6,21 +6,50 @@ cd "$(dirname "$0")"
 URL="${AREENA_URL:?Set AREENA_URL env var (episode URL or series:<ID>)}"
 OUT="${OUT_NAME:-areena.mp4}"
 
-# ----- Python binary on Render/local -----
 PY="python3"
 command -v "$PY" >/dev/null || { echo "❌ python3 not found"; exit 1; }
 
-# ----- Tools sanity -----
-command -v yle-dl >/dev/null || { echo "❌ yle-dl not found"; exit 1; }
-command -v ffmpeg >/dev/null || { echo "❌ ffmpeg not found"; exit 1; }
+# ----- Prepare yle-dl runner (binary or module) -----
+YLEDL=""
+if command -v yle-dl >/dev/null 2>&1; then
+  YLEDL="yle-dl"
+else
+  # Try module
+  if "$PY" - <<'PY' >/dev/null 2>&1; then
+import importlib; importlib.import_module("yle_dl")
+PY
+  then
+    YLEDL="$PY -m yle_dl"
+  else
+    echo "ℹ️  yle-dl not on PATH and module missing — installing now…"
+    pip install --no-cache-dir yle-dl || { echo "❌ Failed to install yle-dl"; exit 1; }
+    if command -v yle-dl >/dev/null 2>&1; then
+      YLEDL="yle-dl"
+    elif "$PY" - <<'PY' >/dev/null 2>&1; then
+import importlib; importlib.import_module("yle_dl")
+PY
+    then
+      YLEDL="$PY -m yle_dl"
+    else
+      echo "❌ yle-dl still not available after install"
+      exit 1
+    fi
+  fi
+fi
 
-echo "Using: $(yle-dl --version | head -n1), $(ffmpeg -version | head -n1)"
+# ----- ffmpeg sanity -----
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "❌ ffmpeg not found (Render should install from apt.txt)."
+  exit 1
+fi
+
+echo "Using yle-dl via: $YLEDL"
+echo "Using ffmpeg: $(ffmpeg -version 2>/dev/null | head -n1)"
 
 # ----- Resolve series:<ID> → latest episode URL via RSS -----
 resolve_latest() {
   local sid="$1"
-  local resolved
-  resolved="$("$PY" - "$sid" <<'PY'
+  "$PY" - "$sid" <<'PY'
 import sys, requests, xml.etree.ElementTree as ET
 sid = sys.argv[1]
 feed = f"https://feeds.yle.fi/areena/v1/series/{sid}.rss?downloadable=true"
@@ -28,21 +57,13 @@ try:
     r = requests.get(feed, timeout=20)
     r.raise_for_status()
     root = ET.fromstring(r.content)
-    items = []
     for item in root.findall(".//item"):
         link = (item.findtext("link") or "").strip()
-        pub  = (item.findtext("pubDate") or "").strip()
-        if link: items.append((pub, link))
-    if not items:
-        print("", end="")
-        sys.exit(0)
-    latest = next((link for _,link in items if link), "")
-    print(latest, end="")
+        if link:
+            print(link, end=""); break
 except Exception:
-    print("", end="")
+    pass
 PY
-)"
-  echo "$resolved"
 }
 
 if [[ "$URL" == series:* ]]; then
@@ -68,7 +89,7 @@ while true; do
   fi
 
   echo "ℹ️  Checking availability hint from yle-dl…"
-  HINT="$(yle-dl -o /dev/null "$URL" 2>&1 || true)"
+  HINT="$($YLEDL -o /dev/null "$URL" 2>&1 || true)"
   TS="$(printf '%s\n' "$HINT" | sed -n 's/.*Becomes available on \([0-9T:+-]\{25,\}\).*/\1/p' | head -n1)"
 
   if [[ -n "${TS:-}" ]]; then
