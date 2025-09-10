@@ -30,11 +30,11 @@ command -v ffmpeg >/dev/null 2>&1 || { echo "❌ ffmpeg not found (apt.txt shoul
 echo "Using yle-dl via: $YLEDL"
 echo "Using ffmpeg: $(ffmpeg -version 2>/dev/null | head -n1)"
 
-# Resolve series:<ID> -> latest episode (RSS → RSS no filter → HTML scan for "1-########")
+# Resolve series:<ID> -> latest episode (RSS → RSS no filter → __NEXT_DATA__ JSON → HTML scan)
 resolve_latest() {
   local sid="$1"
   "$PY" - <<PY
-import re, requests, xml.etree.ElementTree as ET
+import re, json, requests, xml.etree.ElementTree as ET
 sid = "$sid".strip()
 session = requests.Session()
 session.headers.update({"User-Agent":"Mozilla/5.0 (yle-clip-bot)"})
@@ -58,21 +58,57 @@ link = try_rss(f"https://feeds.yle.fi/areena/v1/series/{sid}.rss?downloadable=tr
 if not link:
     link = try_rss(f"https://feeds.yle.fi/areena/v1/series/{sid}.rss")
 
-# 3) fallback: scan HTML for ANY "1-########" IDs (from embedded Next.js JSON), prefer episode-like ids (1-76…)
+def collect_ids_from_nextdata(html: str):
+    # Extract Next.js __NEXT_DATA__ JSON
+    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, flags=re.S)
+    if not m: 
+        return []
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return []
+    # Walk the JSON and collect any strings matching 1-########
+    ids = []
+    def walk(x):
+        if isinstance(x, dict):
+            for v in x.values(): walk(v)
+        elif isinstance(x, list):
+            for v in x: walk(v)
+        elif isinstance(x, str):
+            if re.fullmatch(r"1-\d+", x):
+                ids.append(x)
+    walk(data)
+    return ids
+
+# 3) fallback: __NEXT_DATA__ JSON
 if not link:
     try:
         r = session.get(f"https://areena.yle.fi/{sid}", timeout=20)
         r.raise_for_status()
-        # find all ids like "1-12345678" appearing anywhere in the HTML/JSON
+        html = r.text
+        ids = collect_ids_from_nextdata(html)
+        # de-duplicate, drop the series id
+        seen = {sid}
+        uniq = [x for x in ids if not (x in seen or seen.add(x))]
+        # Prefer episode-like ids (often 1-76...), else first any id
+        preferred = [u for u in uniq if re.match(r"1-76\\d+", u)]
+        pick = (preferred[0] if preferred else (uniq[0] if uniq else ""))
+        if pick:
+            link = "https://areena.yle.fi/" + pick
+    except Exception:
+        pass
+
+# 4) last fallback: scan all HTML for "1-########"
+if not link:
+    try:
+        r = session.get(f"https://areena.yle.fi/{sid}", timeout=20)
+        r.raise_for_status()
         ids = re.findall(r'"(1-\\d+)"', r.text)
-        # de-duplicate, drop the series id itself
+        seen = {sid}
         uniq = []
-        seen = set([sid])
         for s in ids:
             if s not in seen:
-                seen.add(s)
-                uniq.append(s)
-        # prefer ones that look like episode pages (often start with 1-76…)
+                seen.add(s); uniq.append(s)
         preferred = [u for u in uniq if re.match(r"1-76\\d+", u)]
         pick = (preferred[0] if preferred else (uniq[0] if uniq else ""))
         if pick:
@@ -90,7 +126,7 @@ if [[ "$URL" == series:* ]]; then
   echo "Resolving latest episode for series ID: $SID"
   LATEST="$(resolve_latest "$SID" || true)"
   if [[ -z "${LATEST:-}" ]]; then
-    echo "❌ Could not resolve latest episode for series $SID (RSS + HTML scan failed)."
+    echo "❌ Could not resolve latest episode for series $SID (RSS + __NEXT_DATA__ + HTML scan failed)."
     echo "   Tip: set AREENA_URL to a specific episode URL to test."
     exit 1
   fi
