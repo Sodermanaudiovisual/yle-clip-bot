@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 # ----- Config from environment -----
 URL="${AREENA_URL:?Set AREENA_URL env var (episode URL or series:<ID>)}"
 OUT="${OUT_NAME:-areena.mp4}"
+URL="$(printf '%s' "$URL" | xargs)"  # trim
 
 PY="python3"
 command -v "$PY" >/dev/null || { echo "❌ python3 not found"; exit 1; }
@@ -33,40 +34,76 @@ command -v ffmpeg >/dev/null 2>&1 || { echo "❌ ffmpeg not found (apt.txt shoul
 echo "Using yle-dl via: $YLEDL"
 echo "Using ffmpeg: $(ffmpeg -version 2>/dev/null | head -n1)"
 
-# ----- Resolve series:<ID> → latest episode URL via RSS -----
+# ----- Resolve series:<ID> → latest episode URL (RSS → HTML fallback) -----
 resolve_latest() {
   local sid="$1"
-  "$PY" - <<PY
-import requests, xml.etree.ElementTree as ET
-sid = "$sid"
-feed = f"https://feeds.yle.fi/areena/v1/series/{sid}.rss?downloadable=true"
-try:
-    r = requests.get(feed, timeout=20)
-    r.raise_for_status()
-    root = ET.fromstring(r.content)
-    for item in root.findall(".//item"):
-        link = (item.findtext("link") or "").strip()
-        if link:
-            print(link, end=""); break
-except Exception:
-    pass
+  "$PY" - <<'PY'
+import os, re, sys, requests, xml.etree.ElementTree as ET
+sid = sys.argv[1].strip()
+session = requests.Session()
+session.headers.update({"User-Agent":"Mozilla/5.0 (bot) yle-clip-bot"})
+
+def try_rss(url):
+    try:
+        r = session.get(url, timeout=20)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        for item in root.findall(".//item"):
+            link = (item.findtext("link") or "").strip()
+            if link:
+                return link
+    except Exception:
+        pass
+    return ""
+
+# 1) downloadable-only feed
+link = try_rss(f"https://feeds.yle.fi/areena/v1/series/{sid}.rss?downloadable=true")
+# 2) plain feed
+if not link:
+    link = try_rss(f"https://feeds.yle.fi/areena/v1/series/{sid}.rss")
+
+# 3) fallback: scrape series HTML page and pick the first episode link
+if not link:
+    try:
+        r = session.get(f"https://areena.yle.fi/{sid}", timeout=20)
+        r.raise_for_status()
+        # Look for href="/1-76xxxxxx" (episodes)
+        m = re.findall(rb'href="/(1-\d+)"', r.content)
+        # Prefer ones that look like episodes (often 1-76... for programs)
+        if m:
+            # Deduplicate while preserving order
+            seen=set()
+            ordered=[]
+            for b in m:
+                s=b.decode("utf-8")
+                if s not in seen:
+                    seen.add(s); ordered.append(s)
+            # Pick the first viable link
+            if ordered:
+                link = "https://areena.yle.fi/" + ordered[0]
+    except Exception:
+        pass
+
+print(link or "", end="")
 PY
 }
 
 if [[ "$URL" == series:* ]]; then
   SID="${URL#series:}"
+  SID="$(printf '%s' "$SID" | xargs)"
   echo "Resolving latest episode for series ID: $SID"
   LATEST="$(resolve_latest "$SID" || true)"
   if [[ -z "${LATEST:-}" ]]; then
-    echo "❌ Could not resolve latest episode from RSS for series $SID."
+    echo "❌ Could not resolve latest episode for series $SID (RSS + HTML fallback failed)."
+    echo "   Tip: set AREENA_URL to a specific episode URL to test."
     exit 1
   fi
   echo "Latest episode: $LATEST"
   URL="$LATEST"
 fi
 
-echo "Target episode URL: $URL"
-echo "Output name:        $OUT"
+echo "Target episode URL: [$URL]"
+echo "Output name:        [$OUT]"
 
 # ----- Main loop: wait until on-demand, then run pipeline -----
 while true; do
