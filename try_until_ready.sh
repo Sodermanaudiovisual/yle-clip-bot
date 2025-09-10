@@ -30,7 +30,7 @@ command -v ffmpeg >/dev/null 2>&1 || { echo "❌ ffmpeg not found (apt.txt shoul
 echo "Using yle-dl via: $YLEDL"
 echo "Using ffmpeg: $(ffmpeg -version 2>/dev/null | head -n1)"
 
-# Resolve series:<ID> -> latest episode (RSS → RSS no filter → HTML fallback)
+# Resolve series:<ID> -> latest episode (RSS → RSS no filter → HTML scan for "1-########")
 resolve_latest() {
   local sid="$1"
   "$PY" - <<PY
@@ -57,15 +57,26 @@ link = try_rss(f"https://feeds.yle.fi/areena/v1/series/{sid}.rss?downloadable=tr
 # 2) plain feed
 if not link:
     link = try_rss(f"https://feeds.yle.fi/areena/v1/series/{sid}.rss")
-# 3) fallback: scrape series HTML page for the first /1-######## link
+
+# 3) fallback: scan HTML for ANY "1-########" IDs (from embedded Next.js JSON), prefer episode-like ids (1-76…)
 if not link:
     try:
         r = session.get(f"https://areena.yle.fi/{sid}", timeout=20)
         r.raise_for_status()
-        ids = re.findall(r'href="/(1-\d+)"', r.text)
+        # find all ids like "1-12345678" appearing anywhere in the HTML/JSON
+        ids = re.findall(r'"(1-\\d+)"', r.text)
+        # de-duplicate, drop the series id itself
+        uniq = []
+        seen = set([sid])
         for s in ids:
-            link = "https://areena.yle.fi/" + s
-            break
+            if s not in seen:
+                seen.add(s)
+                uniq.append(s)
+        # prefer ones that look like episode pages (often start with 1-76…)
+        preferred = [u for u in uniq if re.match(r"1-76\\d+", u)]
+        pick = (preferred[0] if preferred else (uniq[0] if uniq else ""))
+        if pick:
+            link = "https://areena.yle.fi/" + pick
     except Exception:
         pass
 
@@ -79,7 +90,7 @@ if [[ "$URL" == series:* ]]; then
   echo "Resolving latest episode for series ID: $SID"
   LATEST="$(resolve_latest "$SID" || true)"
   if [[ -z "${LATEST:-}" ]]; then
-    echo "❌ Could not resolve latest episode for series $SID (RSS + HTML fallback failed)."
+    echo "❌ Could not resolve latest episode for series $SID (RSS + HTML scan failed)."
     echo "   Tip: set AREENA_URL to a specific episode URL to test."
     exit 1
   fi
