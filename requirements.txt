@@ -1,0 +1,6 @@
+requests
+dropbox
+python-dotenv
+librosa
+soundfile
+acrcloud
