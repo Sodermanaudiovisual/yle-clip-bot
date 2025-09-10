@@ -30,11 +30,13 @@ command -v ffmpeg >/dev/null 2>&1 || { echo "❌ ffmpeg not found (apt.txt shoul
 echo "Using yle-dl via: $YLEDL"
 echo "Using ffmpeg: $(ffmpeg -version 2>/dev/null | head -n1)"
 
-# Resolve series:<ID> -> latest episode (RSS → RSS no filter → __NEXT_DATA__ JSON → HTML scan)
+# -------- Resolvers --------
+
+# RSS → plain → __NEXT_DATA__ JSON → HTML scan → yle-dl --verbose scrape
 resolve_latest() {
   local sid="$1"
   "$PY" - <<PY
-import re, json, requests, xml.etree.ElementTree as ET
+import re, json, requests, xml.etree.ElementTree as ET, subprocess, shlex, os, sys
 sid = "$sid".strip()
 session = requests.Session()
 session.headers.update({"User-Agent":"Mozilla/5.0 (yle-clip-bot)"})
@@ -59,15 +61,13 @@ if not link:
     link = try_rss(f"https://feeds.yle.fi/areena/v1/series/{sid}.rss")
 
 def collect_ids_from_nextdata(html: str):
-    # Extract Next.js __NEXT_DATA__ JSON
     m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, flags=re.S)
-    if not m: 
+    if not m:
         return []
     try:
         data = json.loads(m.group(1))
     except Exception:
         return []
-    # Walk the JSON and collect any strings matching 1-########
     ids = []
     def walk(x):
         if isinstance(x, dict):
@@ -75,22 +75,20 @@ def collect_ids_from_nextdata(html: str):
         elif isinstance(x, list):
             for v in x: walk(v)
         elif isinstance(x, str):
-            if re.fullmatch(r"1-\d+", x):
+            if re.fullmatch(r"1-\\d+", x):
                 ids.append(x)
     walk(data)
     return ids
 
-# 3) fallback: __NEXT_DATA__ JSON
+# 3) __NEXT_DATA__ JSON
 if not link:
     try:
         r = session.get(f"https://areena.yle.fi/{sid}", timeout=20)
         r.raise_for_status()
         html = r.text
         ids = collect_ids_from_nextdata(html)
-        # de-duplicate, drop the series id
         seen = {sid}
         uniq = [x for x in ids if not (x in seen or seen.add(x))]
-        # Prefer episode-like ids (often 1-76...), else first any id
         preferred = [u for u in uniq if re.match(r"1-76\\d+", u)]
         pick = (preferred[0] if preferred else (uniq[0] if uniq else ""))
         if pick:
@@ -98,7 +96,7 @@ if not link:
     except Exception:
         pass
 
-# 4) last fallback: scan all HTML for "1-########"
+# 4) raw HTML scan for "1-########"
 if not link:
     try:
         r = session.get(f"https://areena.yle.fi/{sid}", timeout=20)
@@ -116,17 +114,42 @@ if not link:
     except Exception:
         pass
 
+# 5) FINAL fallback: ask yle-dl --verbose on the series page and parse program_id / id
+if not link:
+    try:
+        # Build the yle-dl command shown by the shell script
+        # We don't want to download yet; just get verbose output and parse it.
+        env = os.environ.copy()
+        cmd = os.environ.get("YLEDL_CMD","").strip()
+        if not cmd:
+            # Best effort: use "yle-dl" and let PATH/module decide
+            cmd = "yle-dl"
+        full = f"{cmd} --verbose -o /dev/null https://areena.yle.fi/{sid}"
+        proc = subprocess.run(full, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+        out = proc.stdout
+        # Look for JSON-like hints: "program_id": "1-########" OR plain "id": "1-########"
+        m = re.search(r'"program_id"\\s*:\\s*"(?P<id>1-\\d+)"', out)
+        if not m:
+            m = re.search(r'"id"\\s*:\\s*"(?P<id>1-\\d+)"', out)
+        if m:
+            link = "https://areena.yle.fi/" + m.group("id")
+    except Exception:
+        pass
+
 print(link or "", end="")
 PY
 }
 
+# -------- Use resolver if series:ID --------
 if [[ "$URL" == series:* ]]; then
   SID="${URL#series:}"
   SID="$(printf '%s' "$SID" | xargs)"
   echo "Resolving latest episode for series ID: $SID"
+  # Expose the chosen YLEDL launcher to the Python fallback (step 5)
+  export YLEDL_CMD="$YLEDL"
   LATEST="$(resolve_latest "$SID" || true)"
   if [[ -z "${LATEST:-}" ]]; then
-    echo "❌ Could not resolve latest episode for series $SID (RSS + __NEXT_DATA__ + HTML scan failed)."
+    echo "❌ Could not resolve latest episode for series $SID (all fallbacks failed)."
     echo "   Tip: set AREENA_URL to a specific episode URL to test."
     exit 1
   fi
@@ -137,6 +160,7 @@ fi
 echo "Target episode URL: [$URL]"
 echo "Output name:        [$OUT]"
 
+# -------- Main loop --------
 while true; do
   if "$PY" yle_clip_bot.py "$URL" --out "$OUT"; then
     echo "✅ Done: $OUT"; exit 0
