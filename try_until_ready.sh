@@ -9,39 +9,26 @@ OUT="${OUT_NAME:-areena.mp4}"
 PY="python3"
 command -v "$PY" >/dev/null || { echo "❌ python3 not found"; exit 1; }
 
-# ----- Prepare yle-dl runner (binary or module) -----
-YLEDL=""
+# ----- Prepare yle-dl runner (binary or module; install if missing) -----
 if command -v yle-dl >/dev/null 2>&1; then
   YLEDL="yle-dl"
+elif "$PY" -c "import yle_dl" >/dev/null 2>&1; then
+  YLEDL="$PY -m yle_dl"
 else
-  # Try module
-  if "$PY" - <<'PY' >/dev/null 2>&1; then
-import importlib; importlib.import_module("yle_dl")
-PY
-  then
+  echo "ℹ️  yle-dl not found — installing now…"
+  pip install --no-cache-dir yle-dl || { echo "❌ Failed to install yle-dl"; exit 1; }
+  if command -v yle-dl >/dev/null 2>&1; then
+    YLEDL="yle-dl"
+  elif "$PY" -c "import yle_dl" >/dev/null 2>&1; then
     YLEDL="$PY -m yle_dl"
   else
-    echo "ℹ️  yle-dl not on PATH and module missing — installing now…"
-    pip install --no-cache-dir yle-dl || { echo "❌ Failed to install yle-dl"; exit 1; }
-    if command -v yle-dl >/dev/null 2>&1; then
-      YLEDL="yle-dl"
-    elif "$PY" - <<'PY' >/dev/null 2>&1; then
-import importlib; importlib.import_module("yle_dl")
-PY
-    then
-      YLEDL="$PY -m yle_dl"
-    else
-      echo "❌ yle-dl still not available after install"
-      exit 1
-    fi
+    echo "❌ yle-dl still not available after install"
+    exit 1
   fi
 fi
 
 # ----- ffmpeg sanity -----
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "❌ ffmpeg not found (Render should install from apt.txt)."
-  exit 1
-fi
+command -v ffmpeg >/dev/null 2>&1 || { echo "❌ ffmpeg not found (apt.txt should install it)"; exit 1; }
 
 echo "Using yle-dl via: $YLEDL"
 echo "Using ffmpeg: $(ffmpeg -version 2>/dev/null | head -n1)"
@@ -49,9 +36,9 @@ echo "Using ffmpeg: $(ffmpeg -version 2>/dev/null | head -n1)"
 # ----- Resolve series:<ID> → latest episode URL via RSS -----
 resolve_latest() {
   local sid="$1"
-  "$PY" - "$sid" <<'PY'
-import sys, requests, xml.etree.ElementTree as ET
-sid = sys.argv[1]
+  "$PY" - <<PY
+import requests, xml.etree.ElementTree as ET
+sid = "$sid"
 feed = f"https://feeds.yle.fi/areena/v1/series/{sid}.rss?downloadable=true"
 try:
     r = requests.get(feed, timeout=20)
@@ -94,9 +81,9 @@ while true; do
 
   if [[ -n "${TS:-}" ]]; then
     echo "⏳ Not yet available. Release time: $TS"
-    SLEEP_SECS="$("$PY" - "$TS" <<'PY'
-import sys, datetime
-dt = datetime.datetime.fromisoformat(sys.argv[1])
+    SLEEP_SECS="$("$PY" - <<PY
+import datetime
+dt = datetime.datetime.fromisoformat("$TS")
 now = datetime.datetime.now(dt.tzinfo)
 print(max(60, int((dt - now).total_seconds()) + 60))
 PY
